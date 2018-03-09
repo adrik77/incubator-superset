@@ -177,3 +177,17 @@ if flask_app_mutator:
     flask_app_mutator(app)
 
 from superset import views  # noqa
+
+# Override user retrieval from providers
+@sm.oauth_user_info_getter
+def get_oauth_user_info(sm, provider, response=None):
+    logging.info("provider={}".format(provider))
+
+    if provider == 'custom':
+        me = sm.oauth_remotes[provider].get('hr/v2/users/me.json')
+        user = me.data.get('user')
+        logging.info("user={}".format(user))
+        return {'username': "custom_" + user.get('username', '-'),
+                'first_name': user.get('first_name', ''),
+                'last_name': user.get('last_name', ''),
+                'email': user.get('email', '')}

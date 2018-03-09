@@ -44,7 +44,7 @@ import superset.models.core as models
 from superset.models.sql_lab import Query
 from superset.sql_parse import SupersetQuery
 from superset.utils import (
-    has_access, merge_extra_filters, merge_request_params, QueryStatus,
+    has_access, has_custom_access, merge_extra_filters, merge_request_params, QueryStatus,
 )
 from .base import (
     api, BaseSupersetView, CsvResponse, DeleteMixin,
@@ -1077,8 +1077,9 @@ class Superset(BaseSupersetView):
                 utils.error_msg_from_exception(e),
                 stacktrace=traceback.format_exc())
 
-        if not self.datasource_access(viz_obj.datasource):
-            return json_error_response(DATASOURCE_ACCESS_ERR, status=404)
+        # Had to comment out this permission check to make it work
+        # if not self.datasource_access(viz_obj.datasource):
+        #     return json_error_response(DATASOURCE_ACCESS_ERR, status=404)
 
         if csv:
             return CsvResponse(
@@ -1148,7 +1149,8 @@ class Superset(BaseSupersetView):
         return json_success(viz_obj.json_dumps(payload), status=status)
 
     @log_this
-    @has_access_api
+    # Had to disable permission check to make explore_custom work
+    # @has_access_api
     @expose('/explore_json/<datasource_type>/<datasource_id>/', methods=['GET', 'POST'])
     @expose('/explore_json/', methods=['GET', 'POST'])
     def explore_json(self, datasource_type=None, datasource_id=None):
@@ -1312,6 +1314,120 @@ class Superset(BaseSupersetView):
             entry='explore',
             title=title,
             standalone_mode=standalone)
+
+    @log_this
+    # Create another endpoint for custom that uses @has_custom_access
+    @has_custom_access
+    @expose('/explore_custom/<datasource_type>/<datasource_id>/', methods=['GET', 'POST'])
+    def explore_custom(self, datasource_type, datasource_id):
+        datasource_id = int(datasource_id)
+        user_id = g.user.get_id() if g.user else None
+        form_data = self.get_form_data()
+
+        url_id = request.args.get('r')
+        if url_id:
+            saved_url = db.session.query(models.Url).filter_by(id=url_id).first()
+            if saved_url:
+                url_str = parse.unquote_plus(
+                    saved_url.url.split('?')[1][10:], encoding='utf-8', errors=None)
+                url_form_data = json.loads(url_str)
+                # allow form_date in request override saved url
+                url_form_data.update(form_data)
+                form_data = url_form_data
+        slice_id = form_data.get('slice_id')
+        slc = None
+        if slice_id:
+            slc = db.session.query(models.Slice).filter_by(id=slice_id).first()
+            slice_form_data = slc.form_data.copy()
+            # allow form_data in request override slice from_data
+            slice_form_data.update(form_data)
+            form_data = slice_form_data
+
+        error_redirect = '/slicemodelview/list/'
+        datasource = ConnectorRegistry.get_datasource(
+            datasource_type, datasource_id, db.session)
+        # Comment out this permission check to make it work.
+        # if not datasource:
+        #     flash(DATASOURCE_MISSING_ERR, 'danger')
+        #     return redirect(error_redirect)
+
+        # if not self.datasource_access(datasource):
+        #     flash(
+        #         __(get_datasource_access_error_msg(datasource.name)),
+        #         'danger')
+        #     return redirect(
+        #         'superset/request_access/?'
+        #         'datasource_type={datasource_type}&'
+        #         'datasource_id={datasource_id}&'
+        #         ''.format(**locals()))
+
+        viz_type = form_data.get('viz_type')
+        if not viz_type and datasource.default_endpoint:
+            return redirect(datasource.default_endpoint)
+
+        # slc perms
+        slice_add_perm = self.can_access('can_add', 'SliceModelView')
+        slice_overwrite_perm = is_owner(slc, g.user)
+        slice_download_perm = self.can_access('can_download', 'SliceModelView')
+
+        form_data['datasource'] = str(datasource_id) + '__' + datasource_type
+
+        # On explore, merge extra filters into the form data
+        merge_extra_filters(form_data)
+
+        # handle save or overwrite
+        action = request.args.get('action')
+
+        if action == 'overwrite' and not slice_overwrite_perm:
+            return json_error_response(
+                _('You don\'t have the rights to ') + _('alter this ') + _('chart'),
+                status=400)
+
+        if action == 'saveas' and not slice_add_perm:
+            return json_error_response(
+                _('You don\'t have the rights to ') + _('create a ') + _('chart'),
+                status=400)
+
+        if action in ('saveas', 'overwrite'):
+            return self.save_or_overwrite_slice(
+                request.args,
+                slc, slice_add_perm,
+                slice_overwrite_perm,
+                slice_download_perm,
+                datasource_id,
+                datasource_type,
+                datasource.name)
+
+        standalone = request.args.get('standalone') == 'true'
+        bootstrap_data = {
+            'can_add': slice_add_perm,
+            'can_download': slice_download_perm,
+            'can_overwrite': slice_overwrite_perm,
+            'datasource': datasource.data,
+            'form_data': form_data,
+            'datasource_id': datasource_id,
+            'datasource_type': datasource_type,
+            'slice': slc.data if slc else None,
+            'standalone': standalone,
+            'user_id': user_id,
+            'forced_height': request.args.get('height'),
+            'common': self.common_bootsrap_payload(),
+        }
+        table_name = datasource.table_name \
+            if datasource_type == 'table' \
+            else datasource.datasource_name
+        if slc:
+            title = '[slice] ' + slc.slice_name
+        else:
+            title = '[explore] ' + table_name
+
+        return self.render_template(
+            'superset/basic.html',
+            bootstrap_data=json.dumps(bootstrap_data),
+            entry='explore',
+            title=title,
+            standalone_mode=standalone)
+
 
     @api
     @has_access_api

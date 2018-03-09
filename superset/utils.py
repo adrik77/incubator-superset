@@ -45,6 +45,7 @@ import sqlalchemy as sa
 from sqlalchemy import event, exc, select
 from sqlalchemy.types import TEXT, TypeDecorator
 
+import oauthlib.oauth2
 
 logging.getLogger('MARKDOWN').setLevel(logging.INFO)
 
@@ -685,6 +686,55 @@ def get_email_address_list(address_string):
         else:
             address_string = [address_string]
     return address_string
+
+
+# has_access check for the custom system
+def has_custom_access(f):
+
+    # Validate token in the custom system
+    def is_token_valid(self):
+        oauth_remote = self.appbuilder.sm.oauth_remotes['custom']
+        token = request.args.get('oauth_token')
+        user_info_path = 'hr/v2/users/me.json'
+        response = _validate_token_request(oauth_remote, user_info_path, token)
+        return response.code in (200, 201)
+
+    def wraps(self, *args, **kwargs):
+        permission_str = PERMISSION_PREFIX + f._permission_name
+        if is_token_valid(self):
+            return f(self, *args, **kwargs)
+        else:
+            logging.warning(
+                LOGMSG_ERR_SEC_ACCESS_DENIED.format(permission_str,
+                                                    self.__class__.__name__))
+            flash(as_unicode(FLAMSG_ERR_SEC_ACCESS_DENIED), 'danger')
+        # adds next arg to forward to the original path once user is logged in.
+        return redirect(
+            url_for(
+                self.appbuilder.sm.auth_view.__class__.__name__ + '.login',
+                next=request.full_path))
+
+    f._permission_name = f.__name__
+    return functools.update_wrapper(wraps, f)
+
+
+# Execute the call to custom system to retrieve the user
+def _validate_token_request(oauth_remote, url, token):
+
+    client = _make_validate_token_client(oauth_remote.consumer_key, token)
+    url = oauth_remote.expand_url(url)
+
+    uri, headers, body = client.add_token(url)
+
+    resp, content = oauth_remote.http_request(uri, headers)
+    logging.info('Content: %r', content)
+    return resp
+
+
+# Create the client to validate token in the custom system
+def _make_validate_token_client(consumer_key, token):
+    _token = {'access_token': token}
+    return oauthlib.oauth2.WebApplicationClient(consumer_key, token=_token)
 
 
 def has_access(f):
